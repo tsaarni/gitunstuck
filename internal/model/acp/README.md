@@ -1,4 +1,4 @@
-# ACP LLM Provider for ADK
+# ACP Model Provider for ADK
 
 This package implements a bridge between the **Google ADK (Agent Development Kit)** model interface and the **Agent Client Protocol (ACP)**.
 
@@ -24,8 +24,8 @@ The ADK treats LLMs as stateless functions that receive the full conversation hi
 # Available Tools
 You have access to the following tools to interact with the environment:
 
-- **edit**: Replaces a string with another string in a file.
-- **view**: Reads and returns the content of a specified file.
+- **Foo**: Performs the foo action.
+- **Bar**: Performs the bar action.
 
 # Tool Calling Pattern
 To use a tool, follow this ReAct (Thought-Action) pattern strictly:
@@ -44,7 +44,7 @@ Constraints:
 
 ### Example Tool Result
 ```xml
-<tool_result name="run_build" status="error" call_id="123">
-{"exit_code": 1, "output": "main.go:10: undefined: fmt"}
+<tool_result name="foo" status="error" call_id="123">
+{"exit_code": 1, "output": "Quick brown fox jumps over the lazy dog"}
 </tool_result>
 ```

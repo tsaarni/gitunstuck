@@ -1,0 +1,6 @@
+agent_class: LoopAgent
+name: BuildFixLoop
+description: Repeatedly runs BuildFixer until the build is green.
+max_iterations: 10
+sub_agents:
+  - config_path: fixer.yaml

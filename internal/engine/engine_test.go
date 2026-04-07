@@ -15,7 +15,7 @@ func TestNew(t *testing.T) {
 			name:          "default",
 			cfg:           Config{},
 			expectedProv:  "google",
-			expectedModel: "gemini-3.1-flash-lite-preview",
+			expectedModel: "gemini-3.1-flash",
 		},
 		{
 			name: "openai_default_model",
@@ -23,7 +23,7 @@ func TestNew(t *testing.T) {
 				Provider: "openai",
 			},
 			expectedProv:  "openai",
-			expectedModel: "gpt-5-mini",
+			expectedModel: "gpt-5.4-mini",
 		},
 		{
 			name: "anthropic_default_model",
@@ -31,7 +31,15 @@ func TestNew(t *testing.T) {
 				Provider: "anthropic",
 			},
 			expectedProv:  "anthropic",
-			expectedModel: "claude-4-haiku",
+			expectedModel: "claude-4.6-sonnet",
+		},
+		{
+			name: "acp_default_model",
+			cfg: Config{
+				Provider: "acp",
+			},
+			expectedProv:  "acp",
+			expectedModel: "claude-4.6-sonnet",
 		},
 		{
 			name: "custom_model",

@@ -1,0 +1,7 @@
+agent_class: SequentialAgent
+name: GitUnstuckRoot
+description: Orchestrates merge conflict resolution and build fixing.
+sub_agents:
+  - config_path: summarizer.yaml
+  - config_path: resolver.yaml
+  - config_path: fixer_loop.yaml

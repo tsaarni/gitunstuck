@@ -5,32 +5,31 @@ import (
 	"google.golang.org/adk/tool/functiontool"
 )
 
-var (
-	BuildCommand string
-	TestCommand  string
-)
+var BuildCommand string
+var TestCommand string
 
-type CommandResult struct {
-	Ok     bool   `json:"ok" jsonschema:"True if the command exited with code 0."`
-	Output string `json:"output" jsonschema:"Combined stdout and stderr from the command."`
-}
-
-func RunBuildTool(ctx tool.Context, args struct{}) (CommandResult, error) {
+func BuildProjectTool(ctx tool.Context, args struct{}) (GitResult, error) {
 	out, err := RunCommand("sh", "-c", BuildCommand)
-	return CommandResult{Ok: err == nil, Output: out}, nil
+	return GitResult{Ok: err == nil, Output: out}, nil
 }
 
-func RunTestsTool(ctx tool.Context, args struct{}) (CommandResult, error) {
+func TestProjectTool(ctx tool.Context, args struct{}) (GitResult, error) {
 	out, err := RunCommand("sh", "-c", TestCommand)
-	return CommandResult{Ok: err == nil, Output: out}, nil
+	return GitResult{Ok: err == nil, Output: out}, nil
 }
 
-func NewRunBuildTool() tool.Tool {
-	t, _ := functiontool.New(functiontool.Config{Name: "run_build"}, RunBuildTool)
+func NewProjectBuildTool() tool.Tool {
+	t, _ := functiontool.New(functiontool.Config{
+		Name:        "project_build",
+		Description: "Build the project using the configured build command.",
+	}, BuildProjectTool)
 	return t
 }
 
-func NewRunTestsTool() tool.Tool {
-	t, _ := functiontool.New(functiontool.Config{Name: "run_tests"}, RunTestsTool)
+func NewProjectTestTool() tool.Tool {
+	t, _ := functiontool.New(functiontool.Config{
+		Name:        "project_test",
+		Description: "Run tests for the project using the configured test command.",
+	}, TestProjectTool)
 	return t
 }

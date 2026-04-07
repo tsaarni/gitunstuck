@@ -1,6 +1,7 @@
 package git
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,6 +13,10 @@ type Client struct {
 	BaseDir string
 }
 
+func NewClient(baseDir string) *Client {
+	return &Client{BaseDir: baseDir}
+}
+
 func (c *Client) exec(name string, arg ...string) *exec.Cmd {
 	cmd := exec.Command(name, arg...)
 	if c.BaseDir != "" {
@@ -20,28 +25,28 @@ func (c *Client) exec(name string, arg ...string) *exec.Cmd {
 	return cmd
 }
 
-func (c *Client) StatusPorcelain() ([]string, error) {
-	cmd := c.exec("git", "status", "--porcelain")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, err
+func (c *Client) Git(args ...string) (string, error) {
+	for _, arg := range args {
+		if strings.Contains(arg, "..") {
+			return "", fmt.Errorf("argument contains '..'")
+		}
 	}
-	return strings.Split(string(out), "\n"), nil
+	cmd := c.exec("git", args...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 func (c *Client) UnmergedFiles() ([]string, error) {
-	lines, err := c.StatusPorcelain()
+	out, err := c.exec("git", "diff", "--name-only", "--diff-filter=U").Output()
 	if err != nil {
 		return nil, err
 	}
+
 	var files []string
-	for _, line := range lines {
-		if len(line) < 3 {
-			continue
-		}
-		status := line[:2]
-		if strings.Contains(status, "U") || status == "AA" || status == "DD" {
-			files = append(files, strings.TrimSpace(line[3:]))
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		if file := scanner.Text(); file != "" {
+			files = append(files, file)
 		}
 	}
 	return files, nil
@@ -104,73 +109,111 @@ func (c *Client) Add(path string) error {
 }
 
 type MergeInfo struct {
-	Base            string
-	LocalLabel      string
-	IncomingLabel   string
-	LocalDiff       string
-	IncomingDiff    string
-	LocalLogs       string
-	IncomingLogs    string
-	ConflictedFiles []string
-	Operation       string
+	Type          string   `json:"type" jsonschema:"Type of operation (merge, rebase, cherry-pick)"`
+	Files         []string `json:"files" jsonschema:"Unmerged files"`
+	Local         []string `json:"local" jsonschema:"Local branch commits"`
+	Incoming      []string `json:"incoming" jsonschema:"Incoming branch commits"`
+	Base          string   `json:"base"`
+	LocalDiff     string   `json:"local_diff"`
+	IncomingDiff  string   `json:"incoming_diff"`
+	IncomingLabel string   `json:"incoming_label"`
 }
 
 func (c *Client) DiffHEADStat() (string, error) {
-	out, err := c.exec("git", "diff", "HEAD", "--stat").Output()
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
+	return c.Git("diff", "HEAD", "--stat")
 }
 
-func (c *Client) GetMergeContext() (*MergeInfo, error) {
-	var info MergeInfo
-	var other string
+func (c *Client) ValidateArgs(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("no arguments provided")
+	}
 
-	mergeHead, err := c.exec("git", "rev-parse", "MERGE_HEAD").Output()
-	if err == nil {
-		// Standard Merge
-		other = strings.TrimSpace(string(mergeHead))
-		info.IncomingLabel = "MERGE_HEAD"
-		info.LocalLabel = "HEAD"
-		info.Operation = "merge"
-	} else {
-		// Check for Rebase
-		rebaseHead, err := c.exec("git", "rev-parse", "REBASE_HEAD").Output()
-		if err == nil {
-			// Rebase in progress
-			other = strings.TrimSpace(string(rebaseHead))
-			info.IncomingLabel = "REBASE_HEAD"
-			info.LocalLabel = "HEAD (rebase-onto)"
-			info.Operation = "rebase"
-		} else {
-			return nil, fmt.Errorf("no active merge or rebase detected (MERGE_HEAD or REBASE_HEAD not found)")
+	sub := args[0]
+	allowed := false
+	allowedSubcommands := map[string][]string{
+		"Inspection": {"status", "diff", "log", "show", "grep", "blame", "ls-files", "rev-parse", "rev-list", "branch", "cat-file"},
+		"Staging":    {"add", "rm"},
+		"Resolve":    {"rebase", "cherry-pick", "restore"},
+		"Utility":    {"stash"},
+	}
+
+	for _, subs := range allowedSubcommands {
+		for _, s := range subs {
+			if s == sub {
+				allowed = true
+				break
+			}
+		}
+	}
+	if !allowed {
+		return fmt.Errorf("subcommand '%s' not allowed", sub)
+	}
+
+	for _, arg := range args {
+		if arg == "--force" || arg == "-f" || arg == "--hard" || arg == "--pager" {
+			return fmt.Errorf("flag '%s' is blocked", arg)
 		}
 	}
 
+	if sub == "rebase" {
+		allowedFlags := []string{"--continue", "--abort", "--skip"}
+		isAllowedFlag := false
+		for _, arg := range args[1:] {
+			for _, allowedFlag := range allowedFlags {
+				if arg == allowedFlag {
+					isAllowedFlag = true
+					break
+				}
+			}
+		}
+		if !isAllowedFlag {
+			return fmt.Errorf("subcommand 'rebase' is only allowed with --continue, --abort, or --skip")
+		}
+	}
+	return nil
+}
+
+func (c *Client) GetMergeContext() (*MergeInfo, error) {
 	files, err := c.UnmergedFiles()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get unmerged files: %w", err)
+		return nil, err
 	}
-	info.ConflictedFiles = files
 
-	base, err := c.exec("git", "merge-base", "HEAD", other).Output()
+	info := &MergeInfo{Files: files}
+
+	// Detect merge/rebase/cherry-pick
+	if _, err := os.Stat(filepath.Join(c.BaseDir, ".git/MERGE_HEAD")); err == nil {
+		info.Type = "merge"
+		info.IncomingLabel = "MERGE_HEAD"
+		info.Base, _ = c.Git("merge-base", "HEAD", "MERGE_HEAD")
+		info.Base = strings.TrimSpace(info.Base)
+		info.LocalDiff, _ = c.Git("diff", info.Base, "HEAD", "--stat")
+		info.IncomingDiff, _ = c.Git("diff", info.Base, "MERGE_HEAD", "--stat")
+		info.Local, _ = c.log("HEAD", "MERGE_HEAD")
+		info.Incoming, _ = c.log("MERGE_HEAD", "HEAD")
+	} else if _, err := os.Stat(filepath.Join(c.BaseDir, ".git/rebase-apply")); err == nil {
+		info.Type = "rebase"
+		info.IncomingLabel = "rebase"
+	} else if _, err := os.Stat(filepath.Join(c.BaseDir, ".git/rebase-merge")); err == nil {
+		info.Type = "rebase"
+		info.IncomingLabel = "rebase"
+	} else if _, err := os.Stat(filepath.Join(c.BaseDir, ".git/CHERRY_PICK_HEAD")); err == nil {
+		info.Type = "cherry-pick"
+		info.IncomingLabel = "CHERRY_PICK_HEAD"
+	}
+
+	return info, nil
+}
+
+func (c *Client) log(branch, other string) ([]string, error) {
+	out, err := c.exec("git", "log", "--oneline", "-n", "10", branch+".."+other).Output()
 	if err != nil {
-		return nil, fmt.Errorf("could not find common ancestor between HEAD and %s", info.IncomingLabel)
+		return nil, err
 	}
-	info.Base = strings.TrimSpace(string(base))
-
-	diffLocal, _ := c.exec("git", "diff", info.Base, "HEAD", "--stat").Output()
-	info.LocalDiff = string(diffLocal)
-
-	diffIncoming, _ := c.exec("git", "diff", info.Base, other, "--stat").Output()
-	info.IncomingDiff = string(diffIncoming)
-
-	localLogs, _ := c.exec("git", "log", "--oneline", fmt.Sprintf("%s..HEAD", info.Base)).Output()
-	info.LocalLogs = string(localLogs)
-
-	logs, _ := c.exec("git", "log", "--oneline", fmt.Sprintf("%s..%s", info.Base, other)).Output()
-	info.IncomingLogs = string(logs)
-
-	return &info, nil
+	var logs []string
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		logs = append(logs, scanner.Text())
+	}
+	return logs, nil
 }

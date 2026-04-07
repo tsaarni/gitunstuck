@@ -3,17 +3,18 @@ package engine
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"os"
+	"strings"
+
 	"github.com/tsaarni/gitunstuck/internal/agents"
 	"github.com/tsaarni/gitunstuck/internal/git"
 	"github.com/tsaarni/gitunstuck/internal/model/acp"
 	"github.com/tsaarni/gitunstuck/internal/tools"
-	"log/slog"
-	"os"
 
 	genaianthropic "github.com/achetronic/adk-utils-go/genai/anthropic"
 	genaiopenai "github.com/achetronic/adk-utils-go/genai/openai"
 	"google.golang.org/adk/agent"
-	"google.golang.org/adk/agent/workflowagents/loopagent"
 	"google.golang.org/adk/artifact"
 	"google.golang.org/adk/model"
 	"google.golang.org/adk/model/gemini"
@@ -44,6 +45,8 @@ type Config struct {
 	MaxIterations uint
 	// MaxOutputTokens is the maximum number of tokens in the LLM response.
 	MaxOutputTokens int32
+	// MaxHistoryItems is the maximum number of items in the conversation history.
+	MaxHistoryItems int
 }
 
 // Engine manages the high-level workflow for resolving git conflicts
@@ -74,67 +77,111 @@ func New(cfg Config) *Engine {
 	if cfg.ModelName == "" {
 		switch cfg.Provider {
 		case "openai":
-			cfg.ModelName = "gpt-5-mini"
+			cfg.ModelName = "gpt-5.4-mini"
 		case "anthropic":
-			cfg.ModelName = "claude-4-haiku"
+			cfg.ModelName = "claude-4.6-sonnet"
+		case "acp":
+			cfg.ModelName = "claude-4.6-sonnet"
+		case "google":
+			// alternative
+			// cfg.ModelName = gemini-3-flash-preview
+			cfg.ModelName = "gemini-2.5-flash"
 		default:
-			cfg.ModelName = "gemini-3.1-flash-lite-preview"
 		}
+	}
+	if cfg.MaxOutputTokens == 0 {
+		cfg.MaxOutputTokens = 8192
+	}
+	if cfg.MaxHistoryItems == 0 {
+		cfg.MaxHistoryItems = 40
 	}
 	return &Engine{
 		cfg:       cfg,
-		gitClient: &git.Client{BaseDir: cfg.WorkingDir},
+		gitClient: git.NewClient(cfg.WorkingDir),
 	}
+}
+
+func (e *Engine) GetInitialState() (map[string]any, error) {
+	mergeCtx, err := e.gitClient.GetMergeContext()
+	if err != nil {
+		return nil, fmt.Errorf("no active merge or rebase context found: %w", err)
+	}
+	if len(mergeCtx.Files) == 0 {
+		return nil, fmt.Errorf("no unmerged files found")
+	}
+
+	worktreeDiff, _ := e.gitClient.DiffHEADStat()
+	return map[string]any{
+		"operation":          mergeCtx.Type,
+		"conflicted_files":   strings.Join(mergeCtx.Files, "\n"),
+		"base":               mergeCtx.Base,
+		"local_diff":         mergeCtx.LocalDiff,
+		"local_logs":         strings.Join(mergeCtx.Local, "\n"),
+		"incoming_diff":      mergeCtx.IncomingDiff,
+		"incoming_logs":      strings.Join(mergeCtx.Incoming, "\n"),
+		"incoming_label":     mergeCtx.IncomingLabel,
+		"summarizer_summary": "No intention summary available.",
+		"fix_history":        "",
+		"max_history_items":  e.cfg.MaxHistoryItems,
+		"worktree_diff":      worktreeDiff,
+	}, nil
 }
 
 // Run executes the full conflict resolution and build verification workflow.
 func (e *Engine) Run(ctx context.Context) error {
 	// 1. Initial State Check
-	mergeCtx, err := e.gitClient.GetMergeContext()
+	initialState, err := e.GetInitialState()
 	if err != nil {
-		return fmt.Errorf("no active merge or rebase context found: %w", err)
-	}
-	if len(mergeCtx.ConflictedFiles) == 0 {
-		return fmt.Errorf("no unmerged files found")
-	}
-
-	// 2. Prepare Environment
-	if err := e.prepare(ctx); err != nil {
 		return err
 	}
 
-	// 3. Step 1: Conflict Resolution
-	slog.Info("Starting Step 1: Conflict Resolution")
-	agentCfg := agents.Config{
-		Model:           e.llm,
-		MaxOutputTokens: e.cfg.MaxOutputTokens,
-		GitClient:       e.gitClient,
-		MergeContext:    mergeCtx,
-	}
-	resolver, _ := agents.NewResolver(agentCfg)
-	if err := e.executeStep(ctx, "session-resolve", resolver, "Please assess the unmerged files and resolve the conflicts."); err != nil {
-		return fmt.Errorf("conflict resolution failed: %w", err)
+	// 2. Prepare Environment
+	if err := e.Prepare(ctx); err != nil {
+		return err
 	}
 
-	// 4. Step 2: Build & Test Verification
-	if e.cfg.BuildCommand != "" || e.cfg.TestCommand != "" {
-		slog.Info("Starting Step 2: Build and Test Verification")
-		fixer, _ := agents.NewFixer(agentCfg)
-		loopingFixer, _ := loopagent.New(loopagent.Config{
-			AgentConfig:   agent.Config{Name: "BuildFixerLoop", SubAgents: []agent.Agent{fixer}},
-			MaxIterations: e.cfg.MaxIterations,
-		})
-		if err := e.executeStep(ctx, "session-fix", loopingFixer, "Please run the build, identify any errors, and fix them iteratively until the tests pass."); err != nil {
-			return fmt.Errorf("build fixing failed: %w", err)
-		}
+	// 3. Register Context Variables
+	if _, err := e.sessionSvc.Create(ctx, &session.CreateRequest{
+		AppName:   "gitunstuck",
+		UserID:    "user",
+		SessionID: "main",
+		State:     initialState,
+	}); err != nil {
+		return fmt.Errorf("failed to create session: %w", err)
+	}
+
+	// 4. Load Root Agent from YAML
+	slog.Info("Loading Root Agent from YAML")
+	rootAgent, err := e.GetRootAgent(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to load root agent: %w", err)
+	}
+
+	// 5. Execute Workflow
+	slog.Info("Starting GitUnstuck Workflow")
+	if err := e.executeStep(ctx, "main", rootAgent, "Please resolve the merge conflicts and ensure the build is green."); err != nil {
+		return fmt.Errorf("workflow execution failed: %w", err)
 	}
 
 	slog.Info("Resolution process completed.")
 	return nil
 }
 
-// prepare initializes dependencies like the LLM and services.
-func (e *Engine) prepare(ctx context.Context) error {
+// SessionSvc returns the engine's session service.
+func (e *Engine) SessionSvc() session.Service {
+	return e.sessionSvc
+}
+
+// ArtifactSvc returns the engine's artifact service.
+func (e *Engine) ArtifactSvc() artifact.Service {
+	return e.artifactSvc
+}
+
+// Prepare initializes dependencies like the LLM and services.
+func (e *Engine) Prepare(ctx context.Context) error {
+	if e.llm != nil {
+		return nil
+	}
 	slog.Info("Preparing engine",
 		"provider", e.cfg.Provider,
 		"model", e.cfg.ModelName,
@@ -154,7 +201,20 @@ func (e *Engine) prepare(ctx context.Context) error {
 	tools.TestCommand = e.cfg.TestCommand
 	tools.WorkingDir = e.cfg.WorkingDir
 
+	// Initialize global agents config
+	agents.DefaultMaxHistoryItems = e.cfg.MaxHistoryItems
+
 	return nil
+}
+
+// GetRootAgent loads and returns the primary agent.
+func (e *Engine) GetRootAgent(ctx context.Context) (agent.Agent, error) {
+	configPath := "config/root.yaml"
+	return agents.LoadAgentFromConfig(ctx, configPath, e.llm)
+}
+
+func (e *Engine) prepare(ctx context.Context) error {
+	return e.Prepare(ctx)
 }
 
 // setupLLM initializes the LLM based on configuration
@@ -189,12 +249,15 @@ func (e *Engine) setupLLM(ctx context.Context) (model.LLM, error) {
 			ModelName: e.cfg.ModelName,
 		})
 	default:
-		if e.cfg.APIKey == "" {
+		if e.cfg.APIKey == "" && os.Getenv("GOOGLE_API_KEY") == "" {
 			return nil, fmt.Errorf("API Key not set for google")
 		}
 		genaiCfg := &genai.ClientConfig{
 			APIKey:  e.cfg.APIKey,
 			Backend: genai.BackendGeminiAPI,
+		}
+		if genaiCfg.APIKey == "" {
+			genaiCfg.APIKey = os.Getenv("GOOGLE_API_KEY")
 		}
 		llm, err = gemini.NewModel(ctx, e.cfg.ModelName, genaiCfg)
 	}
@@ -212,12 +275,14 @@ func (e *Engine) setupServices() (session.Service, artifact.Service) {
 
 // executeStep handles the lifecycle of an agent execution within a specific step.
 func (e *Engine) executeStep(ctx context.Context, sessionID string, a agent.Agent, prompt string) error {
-	// Create Session
-	if _, err := e.sessionSvc.Create(ctx, &session.CreateRequest{AppName: "gitunstuck", UserID: "user", SessionID: sessionID}); err != nil {
-		return err
+	// Session should already exist (created in Run)
+	if _, err := e.sessionSvc.Get(ctx, &session.GetRequest{AppName: "gitunstuck", UserID: "user", SessionID: sessionID}); err != nil {
+		if _, err := e.sessionSvc.Create(ctx, &session.CreateRequest{AppName: "gitunstuck", UserID: "user", SessionID: sessionID}); err != nil {
+			return err
+		}
 	}
 
-	// Create Runner
+	// Create Runner with Retry plugin
 	r, err := runner.New(runner.Config{
 		AppName: "gitunstuck", Agent: a, SessionService: e.sessionSvc, ArtifactService: e.artifactSvc,
 		PluginConfig: runner.PluginConfig{Plugins: []*plugin.Plugin{e.logger}},

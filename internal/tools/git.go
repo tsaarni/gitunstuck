@@ -2,9 +2,10 @@ package tools
 
 import (
 	"fmt"
-	"github.com/tsaarni/gitunstuck/internal/git"
 	"sort"
 	"strings"
+
+	"github.com/tsaarni/gitunstuck/internal/git"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"google.golang.org/adk/tool"
@@ -16,33 +17,36 @@ type GitArgs struct {
 }
 
 type ThreeWayMergeArgs struct {
+	Files []string `json:"files" jsonschema:"Files to merge. If empty, all unmerged files are processed."`
 }
 
 type ThreeWayMergeResult struct {
-	Resolved   []string `json:"resolved" jsonschema:"Files successfully merged. Conflict markers removed."`
+	Merged     []string `json:"merged" jsonschema:"Successfully merged files."`
 	Conflicted []string `json:"conflicted" jsonschema:"Files that still have conflict markers."`
 }
 
 func ThreeWayMergeTool(ctx tool.Context, args ThreeWayMergeArgs) (ThreeWayMergeResult, error) {
-	client := &git.Client{BaseDir: WorkingDir}
+	client := git.NewClient(WorkingDir)
 	files, err := client.UnmergedFiles()
 	if err != nil {
 		return ThreeWayMergeResult{}, err
 	}
 
-	result := ThreeWayMergeResult{Resolved: []string{}, Conflicted: []string{}}
+	result := ThreeWayMergeResult{}
 	for _, file := range files {
-		if err := client.MergeFile(file); err == nil {
-			result.Resolved = append(result.Resolved, file)
+		err := client.MergeFile(file)
+		if err == nil {
+			result.Merged = append(result.Merged, file)
 		} else {
 			result.Conflicted = append(result.Conflicted, file)
 		}
 	}
+
 	return result, nil
 }
 
 type GitResult struct {
-	Ok     bool   `json:"ok" jsonschema:"True if git exited with code 0."`
+	Ok     bool   `json:"ok" jsonschema:"Whether the command succeeded."`
 	Output string `json:"output" jsonschema:"Output from the git command."`
 }
 
@@ -87,12 +91,13 @@ func GitTool(ctx tool.Context, args GitArgs) (GitResult, error) {
 		}
 	}
 
-	out, err := RunCommand("git", args.Args...)
+	client := git.NewClient(WorkingDir)
+	out, err := client.Git(args.Args...)
 	return GitResult{Ok: err == nil, Output: out}, nil
 }
 
 func GetMergeContextTool(ctx tool.Context, args struct{}) (*git.MergeInfo, error) {
-	client := &git.Client{BaseDir: WorkingDir}
+	client := git.NewClient(WorkingDir)
 	return client.GetMergeContext()
 }
 
@@ -102,12 +107,12 @@ func NewGitTool() tool.Tool {
 	return t
 }
 
-func NewThreeWayMergeTool() tool.Tool {
+func NewGitMerge3WayTool() tool.Tool {
 	t, _ := functiontool.New(functiontool.Config{Name: "run_3way_merge"}, ThreeWayMergeTool)
 	return t
 }
 
-func NewGetMergeContextTool() tool.Tool {
+func NewGitMergeContextTool() tool.Tool {
 	t, _ := functiontool.New(functiontool.Config{Name: "get_merge_context"}, GetMergeContextTool)
 	return t
 }

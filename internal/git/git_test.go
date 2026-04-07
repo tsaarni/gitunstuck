@@ -64,7 +64,7 @@ func TestUnmergedFiles(t *testing.T) {
 	tempDir := setupTestRepo(t)
 	defer os.RemoveAll(tempDir)
 
-	client := &Client{BaseDir: tempDir}
+	client := NewClient(tempDir)
 	files, err := client.UnmergedFiles()
 	if err != nil {
 		t.Fatalf("UnmergedFiles failed: %v", err)
@@ -79,7 +79,7 @@ func TestGetMergeContext(t *testing.T) {
 	tempDir := setupTestRepo(t)
 	defer os.RemoveAll(tempDir)
 
-	client := &Client{BaseDir: tempDir}
+	client := NewClient(tempDir)
 	info, err := client.GetMergeContext()
 	if err != nil {
 		t.Fatalf("GetMergeContext failed: %v", err)
@@ -176,9 +176,45 @@ func TestMergeFile(t *testing.T) {
 	cmd.Dir = tempDir
 	_ = cmd.Run() // Definitely conflict now
 
-	client := &Client{BaseDir: tempDir}
+	client := NewClient(tempDir)
 	err = client.MergeFile(filename)
 	if err == nil {
 		t.Errorf("expected MergeFile to return error for overlapping changes, got nil")
+	}
+}
+
+func TestGitValidation(t *testing.T) {
+	client := NewClient("")
+
+	tests := []struct {
+		args    []string
+		wantErr bool
+		msg     string
+	}{
+		{[]string{"status"}, false, ""},
+		{[]string{"log", "--oneline"}, false, ""},
+		{[]string{"checkout", "main"}, true, "subcommand 'checkout' not allowed"},
+		{[]string{"add", "--force", "."}, true, "flag '--force' is blocked"},
+		{[]string{"rebase", "main"}, true, "subcommand 'rebase' is only allowed with --continue, --abort, or --skip"},
+		{[]string{"rebase", "--continue"}, false, ""},
+		{[]string{"log", "--pager"}, true, "flag '--pager' is blocked"},
+		{[]string{}, true, "no arguments provided"},
+	}
+
+	for _, tt := range tests {
+		err := client.ValidateArgs(tt.args)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("ValidateArgs(%v) error = %v, wantErr %v", tt.args, err, tt.wantErr)
+			continue
+		}
+		if tt.wantErr && !strings.Contains(err.Error(), tt.msg) {
+			t.Errorf("ValidateArgs(%v) error = %v, want msg containing %q", tt.args, err, tt.msg)
+		}
+	}
+
+	// Test the '..' check which is in the Git method
+	_, err := client.Git("status", "..")
+	if err == nil || !strings.Contains(err.Error(), "argument contains '..'") {
+		t.Errorf("Git(status, ..) error = %v, want msg containing 'argument contains ..'", err)
 	}
 }

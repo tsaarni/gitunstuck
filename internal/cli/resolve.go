@@ -3,17 +3,38 @@ package cli
 import (
 	"context"
 	"github.com/tsaarni/gitunstuck/internal/engine"
+	"google.golang.org/adk/agent"
+	"google.golang.org/adk/cmd/launcher"
+	"google.golang.org/adk/cmd/launcher/full"
 	"log/slog"
+	"net"
 	"os"
 	"time"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/adk/session"
 )
+
+type stateInjectingSessionService struct {
+	session.Service
+	initialState map[string]any
+}
+
+func (s *stateInjectingSessionService) Create(ctx context.Context, req *session.CreateRequest) (*session.CreateResponse, error) {
+	if req.State == nil {
+		req.State = make(map[string]any)
+	}
+	for k, v := range s.initialState {
+		req.State[k] = v
+	}
+	return s.Service.Create(ctx, req)
+}
 
 func NewResolveCmd() *cobra.Command {
 	var (
 		cfg     engine.Config
 		timeout string
+		webAddr string
 	)
 
 	resolveCmd := &cobra.Command{
@@ -56,6 +77,50 @@ func NewResolveCmd() *cobra.Command {
 
 			e := engine.New(cfg)
 
+			if cmd.Flags().Changed("web") {
+				slog.Info("Starting ADK Web UI on http://" + webAddr)
+				if err := e.Prepare(ctx); err != nil {
+					slog.Error("Engine preparation failed", "error", err)
+					os.Exit(1)
+				}
+				rootAgent, err := e.GetRootAgent(ctx)
+				if err != nil {
+					slog.Error("Failed to get root agent", "error", err)
+					os.Exit(1)
+				}
+
+				initialState, err := e.GetInitialState()
+				if err != nil {
+					slog.Error("Failed to get initial state", "error", err)
+					os.Exit(1)
+				}
+
+				l := full.NewLauncher()
+				cfg := &launcher.Config{
+					AgentLoader:     agent.NewSingleLoader(rootAgent),
+					SessionService:  &stateInjectingSessionService{e.SessionSvc(), initialState},
+					ArtifactService: e.ArtifactSvc(),
+				}
+
+				_, port, err := net.SplitHostPort(webAddr)
+				if err != nil {
+					// Fallback: If not host:port, it might be just port
+					port = webAddr
+				}
+
+				args := []string{
+					"web", "-port", port,
+					"api", "-webui_address", webAddr,
+					"webui", "-api_server_address", "http://" + webAddr + "/api",
+				}
+
+				if err := l.Execute(ctx, cfg, args); err != nil {
+					slog.Error("Web launcher failed", "error", err)
+					os.Exit(1)
+				}
+				return
+			}
+
 			if err := e.Run(ctx); err != nil {
 				slog.Error("Engine failed", "error", err)
 				os.Exit(1)
@@ -71,7 +136,10 @@ func NewResolveCmd() *cobra.Command {
 	resolveCmd.Flags().StringVar(&cfg.ACPCommand, "acp-command", "", "Command to run the ACP agent (e.g. 'kiro-cli acp')")
 	resolveCmd.Flags().UintVar(&cfg.MaxIterations, "max-iterations", 5, "Maximum number of iterations for build fixes")
 	resolveCmd.Flags().Int32Var(&cfg.MaxOutputTokens, "max-output-tokens", 8192, "Maximum tokens generated in a single response")
+	resolveCmd.Flags().IntVar(&cfg.MaxHistoryItems, "max-history", 40, "Maximum number of items to keep in conversation history. An 'item' is a single message (e.g., one user prompt, one agent response, or one tool result).")
 	resolveCmd.Flags().StringVar(&timeout, "timeout", "10m", "Maximum time allowed for the resolution process")
+	resolveCmd.Flags().StringVar(&webAddr, "web", "localhost:8080", "Start ADK Web UI for debugging and interaction. Optional address: --web=localhost:9980")
+	resolveCmd.Flags().Lookup("web").NoOptDefVal = "localhost:8080"
 
 	return resolveCmd
 }
